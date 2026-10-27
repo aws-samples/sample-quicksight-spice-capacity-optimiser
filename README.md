@@ -136,7 +136,7 @@ You can use the default **My Assistant** agent or create a custom one:
 
 Open the chat agent and try:
 - "List my SPICE datasets in account 123456789012"
-- "Scan unused columns in dataset prod10-orders-order-items-products"
+- "Scan unused columns in dataset sample-quicksight-dataset"
 - "Remove the unused columns from that dataset"
 - "What snapshots can you restore for that dataset?" — read-only, and the fastest check that the rollback tools reached the connector
 - "Undo that optimisation" — the agent should list snapshots and ask which one before touching anything
@@ -191,11 +191,11 @@ User:  What SPICE datasets do I have in account 123456789012?
 
 Agent: [calls list_spice_datasets]
        You have 63 SPICE datasets. Here are the top ones by storage:
-       - prod10-orders-order-items-products (4.3 KB)
+       - sample-quicksight-dataset (4.3 KB)
        - sales-summary-2024 (12.1 MB)
        ...
 
-User:  Scan unused columns in prod10-orders-order-items-products
+User:  Scan unused columns in sample-quicksight-dataset
 
 Agent: [calls scan_unused_columns → polls get_job_result]
        Scan complete: 11 of 17 columns are unused.
