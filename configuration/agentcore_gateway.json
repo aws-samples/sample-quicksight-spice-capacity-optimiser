@@ -1,0 +1,68 @@
+{
+    "name": "spice-optimiser-gateway",
+    "description": "AgentCore Gateway for the SPICE Dataset Optimiser MCP server. Amazon Quick chat agent connects via service-to-service OAuth (2LO) using Cognito.",
+    "architecture": {
+        "flow": "Amazon Quick Chat Agent \u2192 Cognito (client_credentials) \u2192 AgentCore Gateway \u2192 Lambda (direct invoke)",
+        "runtime": "none \u2014 the gateway invokes the Lambda directly via a Lambda target",
+        "protocol": "MCP (gateway-managed; no self-hosted HTTP server)",
+        "deployment": "Gateway + Lambda target, managed by the AgentCore CLI (scripts/deploy_mcp.sh)",
+        "inboundAuth": "CUSTOM_JWT (Cognito User Pool)",
+        "note": "There is no MCP server runtime. An earlier design ran one as a CodeZip runtime at 0.0.0.0:8000/mcp, which is where the stale 'spice_optimiser_mcp' runtime name and the five tool names below came from. The gateway resolves the tool from a Lambda target schema and passes the name on the Lambda context."
+    },
+    "authentication": {
+        "type": "Service-to-Service OAuth 2.0 (2LO / client_credentials grant)",
+        "provider": "Amazon Cognito",
+        "flow": {
+            "1_client_request": "Amazon Quick MCP client sends client_id + client_secret to the Cognito token endpoint",
+            "2_token_issued": "Cognito returns a JWT access token with scopes (tools.read, tools.write)",
+            "3_gateway_call": "Amazon Quick attaches the JWT as Bearer token in requests to the AgentCore Gateway",
+            "4_validation": "Gateway validates JWT signature via Cognito OIDC discovery URL, checks allowedClients and allowedScopes",
+            "5_forwarded": "Valid requests are forwarded to the MCP server runtime"
+        },
+        "cognitoConfig": {
+            "_source": "All values below are stack outputs of deployment/template.yaml (CognitoEnabled=true). Read them with: aws cloudformation describe-stacks --stack-name <stack> --query \"Stacks[0].Outputs\"",
+            "userPoolId": "<CognitoUserPoolId output>",
+            "discoveryUrl": "<CognitoDiscoveryUrl output>, e.g. https://cognito-idp.<region>.amazonaws.com/<pool-id>/.well-known/openid-configuration",
+            "domain": "<CognitoDomainPrefix parameter; defaults to qs-spice-optimiser-<account-id>>",
+            "tokenUrl": "<CognitoTokenUrl output>, e.g. https://<domain>.auth.<region>.amazoncognito.com/oauth2/token",
+            "resourceServerId": "<CognitoResourceServerId output> (= <stack>-gateway)",
+            "scopes": [
+                "<stack>-gateway/tools.read",
+                "<stack>-gateway/tools.write"
+            ]
+        },
+        "quickSuiteIntegration": {
+            "mcpServerUrl": "<AgentCore Gateway Resource URL from 'agentcore status'>",
+            "authType": "Service authentication (2LO)",
+            "clientId": "<CognitoClientId output>",
+            "clientSecret": "Stored by the stack in AWS Secrets Manager under <stack>/quick-mcp-client; read it with aws secretsmanager get-secret-value (README step 2). Never paste it into chat, tickets or CI logs.",
+            "tokenUrl": "<CognitoTokenUrl output>"
+        }
+    },
+    "targets": [
+        {
+            "targetName": "spice-optimiser-lambda",
+            "type": "lambda",
+            "toolSchema": "agentcore_project/spiceoptimisermcp/tool-schema.json",
+            "tools": [
+                "list_spice_datasets",
+                "scan_unused_columns",
+                "remove_unused_columns",
+                "get_job_result",
+                "list_snapshots",
+                "rollback_dataset"
+            ]
+        }
+    ],
+    "environmentVariables": {
+        "JOB_STORE_TABLE_NAME": "From CloudFormation stack output: McpJobStoreTableName",
+        "LAMBDA_FUNCTION_ARN": "From CloudFormation stack output: LambdaFunctionArn",
+        "S3_BUCKET": "From CloudFormation stack output: S3BucketName",
+        "S3_PREFIX": "spice-optimiser/"
+    },
+    "setup": {
+        "standard": "Nothing to run: deployment/template.yaml creates the user pool, domain, resource server and client-credentials app client, and scripts/deploy_mcp.sh syncs the gateway authorizer from the stack outputs.",
+        "bringYourOwnPool": "scripts/setup_cognito_oauth.sh --user-pool-id <existing-pool-id> --region <region> --profile <your-profile>  (only for stacks deployed with CognitoEnabled=false)"
+    },
+    "notes": "This file is a reference document. The actual gateway is configured in agentcore.json and deployed with the AgentCore CLI. Run 'scripts/deploy_mcp.sh' to sync env vars from CloudFormation outputs and deploy."
+}

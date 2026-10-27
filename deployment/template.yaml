@@ -1,0 +1,1076 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SPICE Dataset Optimiser - Serverless application that identifies and removes
+  unused columns from Amazon QuickSight SPICE datasets to reduce storage costs
+  and improve refresh performance.
+
+Parameters:
+  ScheduleEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Enable the EventBridge schedule for unattended periodic runs. Off by default:
+      no rule is created unless you ask for one, matching QuarantineEnabled. When
+      enabled you must also set ScheduleTargetDatasets, because a scheduled run has
+      no caller to ask which datasets to process.
+
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(7 days)'
+    Description: >
+      EventBridge schedule expression (cron or rate) for periodic execution.
+      Only used when ScheduleEnabled is true.
+      Examples: 'rate(7 days)', 'rate(1 day)', 'cron(0 2 ? * SUN *)'
+
+  ScheduleExecutionMode:
+    Type: String
+    Default: 'dry_run'
+    AllowedValues:
+      - 'dry_run'
+      - 'apply'
+    Description: >
+      Execution mode for scheduled runs. 'dry_run' analyses and writes a report
+      without changing anything. 'apply' REMOVES COLUMNS FROM YOUR DATASETS on every
+      tick with nobody watching - a snapshot is taken first, but choose it
+      deliberately. Defaults to dry_run.
+
+  ScheduleTargetDatasets:
+    Type: String
+    Default: ''
+    Description: >
+      Dataset IDs for scheduled runs, comma separated
+      (e.g. 'abc-123,def-456'). Required when ScheduleEnabled is true.
+      Deliberately explicit rather than "every SPICE dataset": a full scan costs roughly
+      30-45s per dataset because child discovery walks the account, so more than about
+      15 datasets will exceed the Lambda 15-minute timeout.
+
+  ScheduleSafetyThresholdPct:
+    Type: Number
+    Default: 0.7
+    MinValue: 0.0
+    MaxValue: 1.0
+    Description: >
+      Maximum fraction of a dataset's columns a scheduled run may remove before it
+      halts. Only used when ScheduleEnabled is true.
+
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Optional S3 bucket name for snapshots, reports, and configuration.
+      If left empty, a bucket will be auto-generated.
+
+  QuarantineEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Enable DynamoDB-backed quarantine period tracking for unused columns.
+
+  SNSTopicEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Enable SNS topic for notifications and alerts.
+
+  ConfigS3Key:
+    Type: String
+    Default: 'spice-optimiser/config/config.json'
+    Description: >
+      S3 key path for the optimiser configuration JSON file.
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Optional email address for SNS notification subscription.
+      If left empty, the SNS topic is created (when SNSTopicEnabled is true)
+      but no email subscription is added - which means the alarms below have nobody
+      to tell. Set it for any deployment somebody is meant to look after.
+
+  LogLevel:
+    Type: String
+    Default: 'INFO'
+    AllowedValues:
+      - 'DEBUG'
+      - 'INFO'
+      - 'WARNING'
+      - 'ERROR'
+    Description: >
+      Python log level for the function (read by handler._configure_logging as
+      LOG_LEVEL). INFO is the default on purpose: the INFO lines are the audit trail
+      of which columns were removed from which dataset and from which snapshot, and
+      none of them carries secrets or dataset rows. Use WARNING where the customer
+      wants quieter production logs.
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment package.
+
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key for the Lambda deployment package zip file.
+
+  CognitoEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Enable Cognito User Pool for service-to-service OAuth (2LO) between
+      Amazon Quick MCP client and the AgentCore Gateway.
+
+  CognitoDomainPrefix:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+    ConstraintDescription: >
+      lower-case letters, digits and hyphens, 1-63 characters, no leading or trailing
+      hyphen, or empty to derive one from the account id
+    Description: >
+      Domain prefix for the Cognito token endpoint. Cognito domain prefixes are unique
+      per Region across all AWS accounts, so there is deliberately no fixed default: left
+      empty, the stack uses qs-spice-optimiser-<account-id>, which nobody else can have
+      claimed. Token URL: https://<prefix>.auth.<region>.amazoncognito.com/oauth2/token
+
+Conditions:
+  HasCustomBucketName: !Not [!Equals [!Ref S3BucketName, '']]
+  IsQuarantineEnabled: !Equals [!Ref QuarantineEnabled, 'true']
+  IsScheduleEnabled: !Equals [!Ref ScheduleEnabled, 'true']
+  IsSNSEnabled: !Equals [!Ref SNSTopicEnabled, 'true']
+  HasNotificationEmail: !And
+    - !Condition IsSNSEnabled
+    - !Not [!Equals [!Ref NotificationEmail, '']]
+  IsCognitoEnabled: !Equals [!Ref CognitoEnabled, 'true']
+  HasCognitoDomainPrefix: !Not [!Equals [!Ref CognitoDomainPrefix, '']]
+
+Resources:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # S3 Bucket for snapshots, reports, and configuration
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Server access logs for OptimiserBucket. A separate bucket because S3 will not
+  # deliver a bucket's access logs into itself, and because the logs' retention (one
+  # year, below) is a different decision from the snapshots'. The log bucket has no
+  # access logging of its own: that would need a third bucket, and so on.
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # ACLs disabled, so log delivery is authorised by the bucket policy below rather
+      # than by the legacy log-delivery group ACL.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Only the S3 log delivery service, only for buckets in this account, only
+          # under this stack's prefix. aws:SourceArn is deliberately not used: it would
+          # have to name OptimiserBucket, which depends on this policy existing first.
+          - Sid: AllowS3ServerAccessLogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogBucket.Arn}/${AWS::StackName}/s3-access-logs/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AccessLogBucket.Arn
+              - !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  OptimiserBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # S3 checks that the log destination accepts delivery when logging is configured,
+    # so the destination's policy has to exist before this bucket is created.
+    DependsOn: AccessLogBucketPolicy
+    Properties:
+      BucketName: !If
+        - HasCustomBucketName
+        - !Ref S3BucketName
+        - !Ref AWS::NoValue
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: !Sub '${AWS::StackName}/s3-access-logs/'
+      LifecycleConfiguration:
+        Rules:
+          # Both prefixes must carry the stack-name prefix that S3_PREFIX puts on every
+          # key the function writes. An S3 lifecycle Prefix is a literal string match,
+          # so 'snapshots/' never matched 'spice-optimiser/snapshots/' and neither rule
+          # has ever expired anything. Verified against the live bucket: zero objects
+          # exist at the top-level snapshots/ or reports/, everything is one level down.
+          #
+          # Correcting this makes the documented retention real, which means snapshots
+          # older than 90 days will start being deleted. For a rollback tool that is a
+          # retention decision, not just a bug fix - it bounds how far back an undo can
+          # reach.
+          - Id: ExpireOldSnapshots
+            Status: Enabled
+            Prefix: !Sub '${AWS::StackName}/snapshots/'
+            ExpirationInDays: 90
+          - Id: ExpireOldReports
+            Status: Enabled
+            Prefix: !Sub '${AWS::StackName}/reports/'
+            ExpirationInDays: 365
+
+  # Encryption in transit, enforced rather than assumed: the SDK always uses HTTPS, but
+  # a bucket that also refuses plaintext requests does not depend on every future
+  # client getting that right.
+  OptimiserBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OptimiserBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt OptimiserBucket.Arn
+              - !Sub '${OptimiserBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # DynamoDB Table for quarantine state (conditional)
+  # ─────────────────────────────────────────────────────────────────────────────
+  QuarantineTable:
+    Type: AWS::DynamoDB::Table
+    Condition: IsQuarantineEnabled
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-quarantine'
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref OptimiserKey
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Customer managed KMS key
+  # ─────────────────────────────────────────────────────────────────────────────
+  # One key for everything the stack encrypts: the SNS topic, the function's environment
+  # variables, the log group and both DynamoDB tables. It exists for two reasons. The
+  # topic used to use the AWS managed key alias/aws/sns, whose policy cannot be edited
+  # and does not admit cloudwatch.amazonaws.com, so every alarm action in this template
+  # failed with "CloudWatch Alarms does not have authorization to access the SNS topic
+  # encryption key" and nobody was ever notified. And the environment variables name
+  # the bucket and tables while the logs name every dataset and column touched, which
+  # the customer may want under a key whose policy they control. Each statement below
+  # names exactly one principal and the one service it may use the key through.
+  OptimiserKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # KMS checks that a key policy's principals exist, so the role has to be created
+    # first. Expressed as DependsOn rather than a !GetAtt because the role must not in
+    # turn reference the key (see SNSPublishPolicy).
+    DependsOn: LambdaExecutionRole
+    Properties:
+      Description: !Sub 'Encrypts the ${AWS::StackName} notification topic, Lambda environment, logs and tables'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Standard root statement: keeps the key administrable from the account (the
+          # key would otherwise become unmanageable) and lets the deploying principal
+          # create the grants DynamoDB and Lambda need. In production scope this to the
+          # deployment role (see SECURITY.md).
+          - Sid: AllowKeyAdministrationByTheAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+          # The function's role. Decrypt for its environment variables (Lambda uses the
+          # role's permissions at invocation), decrypt and generate data keys for
+          # publishing to the topic and for its table reads and writes. Only through
+          # those three services in this Region, so the role cannot use the key for
+          # anything else.
+          - Sid: AllowTheOptimiserFunctionThroughItsServices
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-lambda-role'
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService:
+                  - !Sub 'lambda.${AWS::Region}.amazonaws.com'
+                  - !Sub 'sns.${AWS::Region}.amazonaws.com'
+                  - !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+          # CloudWatch Logs, for this stack's log group only (the encryption context is
+          # the log group ARN, which is how the Logs key policy is meant to be scoped).
+          - Sid: AllowCloudWatchLogsForThisStacksLogGroup
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-function'
+          # The alarms. Limited to alarms of this stack in this account, so the
+          # CloudWatch service principal cannot be used as a confused deputy by an alarm
+          # elsewhere. These two condition keys are supported for CloudWatch alarms
+          # (they are not for EventBridge; do not copy this onto an EventBridge grant).
+          - Sid: AllowThisStacksCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-*'
+
+  OptimiserKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}'
+      TargetKeyId: !Ref OptimiserKey
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SNS Topic for notifications (conditional)
+  # ─────────────────────────────────────────────────────────────────────────────
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: IsSNSEnabled
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+      KmsMasterKeyId: !Ref OptimiserKey
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # IAM Execution Role for Lambda
+  # ─────────────────────────────────────────────────────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-function:*'
+
+        - PolicyName: QuickSightReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # quicksight:ListDataSets is the one read action here with no resource
+              # type in the Service Authorization Reference, so '*' is the only
+              # resource it accepts. It is alone in this statement for that reason.
+              - Effect: Allow
+                Action:
+                  - quicksight:ListDataSets
+                Resource: '*'
+              # The remaining reads do accept resource ARNs (dataset/*, analysis/*,
+              # dashboard/*), so they are scoped to this account and region. They cannot
+              # be narrower than that: the tool's whole job is to read every analysis and
+              # dashboard in the account to find which columns of a dataset are in use,
+              # and the datasets it reads are chosen by the caller at run time.
+              - Effect: Allow
+                Action:
+                  - quicksight:DescribeDataSet
+                Resource: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:dataset/*'
+              - Effect: Allow
+                Action:
+                  - quicksight:ListAnalyses
+                  - quicksight:DescribeAnalysis
+                Resource: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:analysis/*'
+              - Effect: Allow
+                Action:
+                  - quicksight:ListDashboards
+                  - quicksight:DescribeDashboard
+                Resource: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:dashboard/*'
+
+        - PolicyName: QuickSightWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # dataset/* rather than a list of dataset ARNs because the datasets to
+              # optimise are an input to each run, not a property of the deployment. The
+              # account and region qualifiers are the real boundary; within them, which
+              # datasets get written is decided by the caller's tool permissions
+              # (Cognito scopes) and the apply-mode confirmation in the dispatcher.
+              - Effect: Allow
+                Action:
+                  - quicksight:UpdateDataSet
+                  - quicksight:CreateIngestion
+                Resource: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:dataset/*'
+
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${OptimiserBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt OptimiserBucket.Arn
+              # Releasing a dataset lock is a delete, and it was not granted, so every
+              # run left its lock in place for the full 30-minute TTL. release() is
+              # deliberately non-raising - it is called from a finally block, where an
+              # exception would mask the real failure - so the denial only ever showed
+              # up as a log line, and the visible symptom was the next operation on that
+              # dataset being refused as locked. That defeats rollback in particular,
+              # whose whole purpose is to react quickly to a change that went wrong.
+              #
+              # Scoped to the locks prefix rather than the bucket because the lock is
+              # the only object the function ever deletes. Keeping snapshots and reports
+              # undeletable is worth something on its own: a snapshot the optimiser
+              # cannot delete is one that survives a bug in the optimiser.
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                Resource: !Sub '${OptimiserBucket.Arn}/${AWS::StackName}/locks/*'
+
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    # Must match METRIC_NAMESPACE in lambda_source/metrics.py. This
+                    # condition previously read '${AWS::StackName}/SpiceOptimiser' while
+                    # the code published to 'SPICEDatasetOptimiser', so every metric was
+                    # denied. It was latent for six weeks — added to the template on
+                    # 2026-08-04 but not deployed until 2026-09-14, so the deployed role
+                    # had no condition and metrics flowed until the stack was updated.
+                    cloudwatch:namespace: 'SPICEDatasetOptimiser'
+
+        - PolicyName: DynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                # Spelled out rather than !GetAtt: the tables are encrypted with
+                # OptimiserKey, whose key policy names this role, so a reference from
+                # the role to a table would close a dependency cycle. TableName is
+                # fixed, so the two forms are identical.
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-quarantine'
+
+        - PolicyName: McpJobStorePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-mcp-jobs'
+
+        - PolicyName: LambdaSelfInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-function'
+
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The ARN is spelled out rather than taken from !Ref NotificationTopic so
+              # that the role does not depend on the topic. The topic depends on
+              # OptimiserKey, whose key policy names this role, so a !Ref here would
+              # close a dependency cycle. TopicName is fixed, so the two are identical.
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-notifications'
+
+        # Lambda writes the failed-invocation record itself, with the function's role,
+        # so the role needs to be able to send to the destination queue and nothing
+        # else about it.
+        - PolicyName: AsyncFailureQueuePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt AsyncFailureQueue.Arn
+
+        # X-Ray's write actions have no resource-level permissions (the managed
+        # AWSXRayDaemonWriteAccess policy is '*' for the same reason), and they only let
+        # the function emit its own trace segments.
+        - PolicyName: XRayTracingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Lambda Function
+  # ─────────────────────────────────────────────────────────────────────────────
+  OptimiserFunction:
+    Type: AWS::Lambda::Function
+    # The log group is created explicitly so that it is encrypted; if the function ran
+    # first, Lambda would create an unencrypted one with the same name.
+    DependsOn: OptimiserLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-function'
+      Description: >
+        SPICE Dataset Optimiser - identifies and removes unused columns from
+        QuickSight SPICE datasets.
+      Runtime: python3.14
+      Handler: lambda_source.handler.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      MemorySize: 512
+      Timeout: 900
+      Role: !GetAtt LambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      KmsKeyArn: !GetAtt OptimiserKey.Arn
+      # Where an asynchronous invocation that failed outright ends up. See
+      # AsyncFailureQueue below for why, and OptimiserFunctionInvokeConfig for the
+      # retry policy that goes with it.
+      DeadLetterConfig:
+        TargetArn: !GetAtt AsyncFailureQueue.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref OptimiserBucket
+          S3_PREFIX: !Sub '${AWS::StackName}/'
+          CONFIG_S3_KEY: !Ref ConfigS3Key
+          LOG_LEVEL: !Ref LogLevel
+          DYNAMODB_TABLE: !If
+            - IsQuarantineEnabled
+            - !Ref QuarantineTable
+            - ''
+          SNS_TOPIC_ARN: !If
+            - IsSNSEnabled
+            - !Ref NotificationTopic
+            - ''
+          STACK_NAME: !Ref AWS::StackName
+          JOB_STORE_TABLE: !Ref McpJobStoreTable
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Asynchronous invocation failures
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Every long-running job is an asynchronous self-invocation (mcp_dispatcher._start_job,
+  # InvocationType=Event) and the schedule is an asynchronous EventBridge target. When
+  # such an invocation fails outright - a timeout, out of memory, a runtime crash before
+  # the handler's own catch-all can write the job's terminal state - Lambda used to
+  # retry it twice and then drop it, leaving nothing to look at and a job that only
+  # get_job_result's staleness check would ever call failed.
+  #
+  # Retries are set to zero on purpose. The handler already turns every exception into a
+  # recorded job failure, so the only way to get here is a failure the code could not
+  # see coming, and a run that mutates datasets should not be silently re-run on the
+  # assumption that it is safe to. The failed event goes to the dead-letter queue below
+  # (a durable record, kept for 14 days, with the error in its message attributes), the
+  # alarm on that queue tells the owner, and when the topic exists the full invocation
+  # record is also sent there, so the email carries the error rather than just the fact.
+  AsyncFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-async-failures'
+      # The AWS managed SQS key rather than the notification key: Lambda writes to the
+      # queue with the function's role, which the aws/sqs key policy already admits for
+      # every principal in the account via SQS, and nothing but this function and the
+      # operator who drains the queue will ever touch it. Access control here is the
+      # queue's default owner-only policy plus the role's single sqs:SendMessage grant.
+      KmsMasterKeyId: alias/aws/sqs
+      KmsDataKeyReusePeriodSeconds: 300
+      MessageRetentionPeriod: 1209600  # 14 days, the maximum, so a failure survives a fortnight's holiday
+
+  AsyncFailureQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AsyncFailureQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Encryption in transit, enforced. The queue's default owner-only access stays
+          # in force; this only adds a deny for any plaintext request.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt AsyncFailureQueue.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  OptimiserFunctionInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref OptimiserFunction
+      Qualifier: '$LATEST'
+      MaximumRetryAttempts: 0
+      DestinationConfig: !If
+        - IsSNSEnabled
+        - OnFailure:
+            Destination: !Ref NotificationTopic
+        - !Ref AWS::NoValue
+
+  AsyncFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-async-failures'
+      AlarmDescription: >
+        Triggers when an asynchronous invocation of the SPICE Dataset Optimiser failed
+        outright and its record landed in the failure queue. Inspect the queue message
+        for the payload and error, then purge the queue once handled.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AsyncFailureQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - IsSNSEnabled
+        - - !Ref NotificationTopic
+        - !Ref AWS::NoValue
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CloudWatch Log Group
+  # ─────────────────────────────────────────────────────────────────────────────
+  OptimiserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-function'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt OptimiserKey.Arn
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # EventBridge Scheduled Rule
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Optional. Created only when ScheduleEnabled=true, so an unattended run is
+  # something you opt into rather than inherit.
+  #
+  # The Input below is the whole point of the redesign. The rule previously carried no
+  # Input at all, so it delivered a bare EventBridge event and the function had to find
+  # its own configuration — which meant an S3 config.json that was never written, so the
+  # schedule silently did nothing for weeks. Passing a complete pipeline event here
+  # makes the scheduled run self-describing: what it will do is visible in the template
+  # and in the rule itself, with no second source of truth to drift.
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Condition: IsScheduleEnabled
+    Properties:
+      Name: !Sub '${AWS::StackName}-schedule'
+      Description: Triggers the SPICE Dataset Optimiser on a configurable schedule.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: OptimiserLambdaTarget
+          Arn: !GetAtt OptimiserFunction.Arn
+          # target_datasets is a comma-separated string rather than a JSON array
+          # because CloudFormation has no map function, so quoting each element of a
+          # CommaDelimitedList is not expressible here. _parse_target_datasets accepts
+          # the string form, which is also what a CLI flag or env var would hand it.
+          Input: !Sub
+            - |
+              {
+                "invocation_source": "schedule",
+                "aws_account_id": "${AWS::AccountId}",
+                "aws_region": "${AWS::Region}",
+                "execution_mode": "${ScheduleExecutionMode}",
+                "target_datasets": "${ScheduleTargetDatasets}",
+                "safety_threshold_pct": ${ScheduleSafetyThresholdPct},
+                "s3_bucket": "${BucketName}",
+                "s3_prefix": "${AWS::StackName}/"
+              }
+            - BucketName: !Ref OptimiserBucket
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsScheduleEnabled
+    Properties:
+      FunctionName: !Ref OptimiserFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # AgentCore Gateway Permission to invoke Lambda
+  # ─────────────────────────────────────────────────────────────────────────────
+  AgentCoreGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OptimiserFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # CloudWatch Alarms for Errors
+  # ─────────────────────────────────────────────────────────────────────────────
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      AlarmDescription: >
+        Triggers when the SPICE Dataset Optimiser Lambda function encounters errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OptimiserFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - IsSNSEnabled
+        - - !Ref NotificationTopic
+        - !Ref AWS::NoValue
+
+  # An unroutable tool call means the gateway and the Lambda disagree about what tools
+  # exist — a schema drift, a renamed tool, or a caller sending the wrong shape. It is
+  # never normal. The old code printed "TOOL_DISPATCH: unknown" on every misroute for
+  # weeks with nothing watching, which is how the routing defect survived; this makes the
+  # next occurrence page someone instead of waiting to be found by hand.
+  UnrecognisedToolAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-unrecognised-tool'
+      AlarmDescription: >
+        Triggers when the Lambda receives a tool call it cannot route. Indicates the
+        AgentCore Gateway tool schema and the dispatcher have diverged, or a caller is
+        sending an unexpected payload shape.
+      # Must match METRIC_NAMESPACE in lambda_source/metrics.py and the
+      # cloudwatch:namespace condition on CloudWatchMetricsPolicy. All three previously
+      # disagreed, so every metric was denied and this alarm could never have fired.
+      Namespace: SPICEDatasetOptimiser
+      MetricName: UnrecognisedToolDispatch
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - IsSNSEnabled
+        - - !Ref NotificationTopic
+        - !Ref AWS::NoValue
+
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-throttles'
+      AlarmDescription: >
+        Triggers when the SPICE Dataset Optimiser Lambda function is throttled.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OptimiserFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - IsSNSEnabled
+        - - !Ref NotificationTopic
+        - !Ref AWS::NoValue
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Cognito User Pool for service-to-service OAuth (2LO)
+  # Amazon Quick MCP client → Cognito (client_credentials) → AgentCore Gateway
+  # ─────────────────────────────────────────────────────────────────────────────
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: IsCognitoEnabled
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-gateway-pool'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        # No human ever sets a password here (client_credentials only, no users), so the
+        # policy is moot in practice; it is set to the strict values anyway so that the
+        # pool is safe if a user is ever added and so scanners have nothing to flag.
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Condition: IsCognitoEnabled
+    Properties:
+      Domain: !If
+        - HasCognitoDomainPrefix
+        - !Ref CognitoDomainPrefix
+        - !Sub 'qs-spice-optimiser-${AWS::AccountId}'
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Condition: IsCognitoEnabled
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Identifier: !Sub '${AWS::StackName}-gateway'
+      Name: SpiceOptimiserGateway
+      Scopes:
+        - ScopeName: tools.read
+          ScopeDescription: Read-only access to MCP tools (list, analyze, status, report)
+        - ScopeName: tools.write
+          ScopeDescription: Write access to MCP tools (apply optimization)
+
+  CognitoMcpClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: IsCognitoEnabled
+    DependsOn: CognitoResourceServer
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: !Sub '${AWS::StackName}-quick-mcp-client'
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub '${AWS::StackName}-gateway/tools.read'
+        - !Sub '${AWS::StackName}-gateway/tools.write'
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # MCP Job Store DynamoDB Table
+  # ─────────────────────────────────────────────────────────────────────────────
+  McpJobStoreTable:
+    Type: AWS::DynamoDB::Table
+    # Retained on stack deletion: the records say who asked for which destructive
+    # operation, which is worth keeping for the 7 days their TTL allows.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-mcp-jobs'
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref OptimiserKey
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      # The records are transient (7-day TTL) and the durable results live in S3, so
+      # recovery is rarely needed; at on-demand pricing the backup costs cents and spares
+      # the discussion with every scanner that flags its absence.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the SPICE Dataset Optimiser Lambda function.
+    Value: !GetAtt OptimiserFunction.Arn
+
+  S3BucketName:
+    Description: Name of the S3 bucket for snapshots, reports, and configuration.
+    Value: !Ref OptimiserBucket
+
+  DynamoDBTableName:
+    Condition: IsQuarantineEnabled
+    Description: Name of the DynamoDB quarantine table.
+    Value: !Ref QuarantineTable
+
+  SNSTopicArn:
+    Condition: IsSNSEnabled
+    Description: ARN of the SNS notification topic.
+    Value: !Ref NotificationTopic
+
+  OptimiserKeyArn:
+    Description: ARN of the customer managed KMS key that encrypts the topic, Lambda environment, logs and tables.
+    Value: !GetAtt OptimiserKey.Arn
+
+  AsyncFailureQueueUrl:
+    Description: URL of the SQS queue that receives failed asynchronous invocations.
+    Value: !Ref AsyncFailureQueue
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution IAM role.
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+  ScheduleRuleArn:
+    Condition: IsScheduleEnabled
+    Description: ARN of the EventBridge scheduled rule.
+    Value: !GetAtt ScheduledRule.Arn
+
+  McpJobStoreTableName:
+    Description: Name of the MCP Job Store DynamoDB table.
+    Value: !Ref McpJobStoreTable
+
+  McpJobStoreTableArn:
+    Description: ARN of the MCP Job Store DynamoDB table.
+    Value: !GetAtt McpJobStoreTable.Arn
+
+  CognitoUserPoolId:
+    Condition: IsCognitoEnabled
+    Description: Cognito User Pool ID for the AgentCore Gateway authorizer.
+    Value: !Ref CognitoUserPool
+
+  CognitoDiscoveryUrl:
+    Condition: IsCognitoEnabled
+    Description: OIDC Discovery URL for the AgentCore Gateway CUSTOM_JWT authorizer.
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}/.well-known/openid-configuration'
+
+  CognitoTokenUrl:
+    Condition: IsCognitoEnabled
+    Description: Token endpoint for Amazon Quick MCP client (2LO / client_credentials).
+    Value: !Sub
+      - 'https://${Domain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+      - Domain: !If
+          - HasCognitoDomainPrefix
+          - !Ref CognitoDomainPrefix
+          - !Sub 'qs-spice-optimiser-${AWS::AccountId}'
+
+  CognitoClientId:
+    Condition: IsCognitoEnabled
+    Description: Client ID for the Amazon Quick MCP M2M app client.
+    Value: !Ref CognitoMcpClient
+
+  CognitoResourceServerId:
+    Condition: IsCognitoEnabled
+    Description: Resource server identifier (scope prefix) for OAuth scopes.
+    Value: !Sub '${AWS::StackName}-gateway'

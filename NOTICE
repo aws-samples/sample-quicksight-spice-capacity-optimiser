@@ -1,0 +1,8 @@
+QuickSight SPICE Capacity Optimiser
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+Licensed under the MIT-0 License. See LICENSE.
+
+This software depends on third-party open-source components, which are listed with
+their licences and copyright notices in THIRD_PARTY_LICENSES.txt. A software bill of
+materials for the deployment package and the CDK application is in docs/sbom/.

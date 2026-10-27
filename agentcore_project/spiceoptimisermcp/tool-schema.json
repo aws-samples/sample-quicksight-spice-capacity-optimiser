@@ -1,0 +1,168 @@
+[
+  {
+    "name": "list_spice_datasets",
+    "description": "List QuickSight SPICE datasets in an AWS account and region. Returns dataset IDs, names, and SPICE capacity consumed in bytes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "aws_account_id": {
+          "type": "string",
+          "description": "The 12-digit AWS account ID"
+        },
+        "region": {
+          "type": "string",
+          "description": "AWS region (e.g. us-east-1)",
+          "default": "us-east-1"
+        }
+      },
+      "required": ["aws_account_id"]
+    }
+  },
+  {
+    "name": "scan_unused_columns",
+    "description": "Scan one or more SPICE datasets for unused columns without making any changes (read-only analysis). Returns a job ID; poll get_job_result until the job completes. The report explains why each retained column is protected, naming the specific dashboard, analysis, or child dataset that requires it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dataset_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of QuickSight dataset IDs to scan"
+        },
+        "aws_account_id": {
+          "type": "string",
+          "description": "The 12-digit AWS account ID"
+        },
+        "region": {
+          "type": "string",
+          "description": "AWS region (e.g. us-east-1)",
+          "default": "us-east-1"
+        },
+        "safety_threshold_pct": {
+          "type": "number",
+          "description": "Maximum fraction of columns that may be removed before the operation halts. Between 0.0 and 1.0. Defaults to 0.7."
+        },
+        "quarantine_period_days": {
+          "type": "integer",
+          "description": "Number of days a column must be continuously unused before it becomes eligible for removal. Omit to disable the quarantine gate."
+        }
+      },
+      "required": ["dataset_ids", "aws_account_id"]
+    }
+  },
+  {
+    "name": "remove_unused_columns",
+    "description": "Remove unused columns from SPICE datasets. This modifies the dataset. A full snapshot is written to S3 first so the change can be rolled back. Always run scan_unused_columns first and get explicit user confirmation before calling this. Returns a job ID; poll get_job_result until the job completes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dataset_ids": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of QuickSight dataset IDs to modify"
+        },
+        "aws_account_id": {
+          "type": "string",
+          "description": "The 12-digit AWS account ID"
+        },
+        "region": {
+          "type": "string",
+          "description": "AWS region (e.g. us-east-1)",
+          "default": "us-east-1"
+        },
+        "action": {
+          "type": "string",
+          "description": "Must be the literal string \"remove\". An explicit confirmation that the caller intends to modify the dataset, not merely analyse it.",
+          "enum": ["remove"]
+        },
+        "safety_threshold_pct": {
+          "type": "number",
+          "description": "Maximum fraction of columns that may be removed before the operation halts. Between 0.0 and 1.0. Defaults to 0.7."
+        },
+        "quarantine_period_days": {
+          "type": "integer",
+          "description": "Number of days a column must be continuously unused before it becomes eligible for removal. Omit to disable the quarantine gate."
+        },
+        "cascade_child_refresh": {
+          "type": "boolean",
+          "description": "After removing columns and refreshing this dataset, also trigger a SPICE refresh for every descendant (child) dataset, parents before children. Prevents child dashboards from showing stale data or errors against the new parent schema. Off by default; a child that cannot be refreshed (e.g. an uploaded-file source) is reported, not treated as a failure."
+        }
+      },
+      "required": ["dataset_ids", "aws_account_id", "action"]
+    }
+  },
+  {
+    "name": "get_job_result",
+    "description": "Poll the status of a scan or remove job. Returns status \"running\", \"completed\", or \"failed\". When completed, includes the summary and the S3 key of the full optimisation report. Poll every 10 seconds while running.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "description": "The job ID returned by scan_unused_columns or remove_unused_columns"
+        }
+      },
+      "required": ["job_id"]
+    }
+  },
+  {
+    "name": "list_snapshots",
+    "description": "List the restorable snapshots for a dataset, newest first. Read-only. Snapshots are written automatically by remove_unused_columns before it changes anything. Call this before rollback_dataset so you can tell the user what would be restored and when it was captured.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dataset_id": {
+          "type": "string",
+          "description": "The QuickSight dataset ID to list snapshots for"
+        },
+        "aws_account_id": {
+          "type": "string",
+          "description": "The 12-digit AWS account ID"
+        },
+        "region": {
+          "type": "string",
+          "description": "AWS region (e.g. us-east-1)",
+          "default": "us-east-1"
+        }
+      },
+      "required": ["dataset_id", "aws_account_id"]
+    }
+  },
+  {
+    "name": "rollback_dataset",
+    "description": "Restore a dataset from a snapshot, undoing a previous column removal. This OVERWRITES the dataset's current definition, so any change made since the snapshot is lost. Runs synchronously and returns when the restore is done. Always call list_snapshots first and confirm with the user which snapshot to restore before calling this.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "dataset_id": {
+          "type": "string",
+          "description": "The QuickSight dataset ID to restore"
+        },
+        "aws_account_id": {
+          "type": "string",
+          "description": "The 12-digit AWS account ID"
+        },
+        "region": {
+          "type": "string",
+          "description": "AWS region (e.g. us-east-1)",
+          "default": "us-east-1"
+        },
+        "action": {
+          "type": "string",
+          "description": "Must be the literal string \"rollback\". An explicit confirmation that the caller intends to overwrite the dataset's current definition.",
+          "enum": ["rollback"]
+        },
+        "snapshot_key": {
+          "type": "string",
+          "description": "Optional S3 key of a specific snapshot from list_snapshots. Omit to restore the most recent."
+        },
+        "trigger_refresh": {
+          "type": "boolean",
+          "description": "Whether to start a SPICE refresh after restoring. Defaults to true; restored columns hold no data until the dataset refreshes.",
+          "default": true
+        }
+      },
+      "required": ["dataset_id", "aws_account_id", "action"]
+    }
+  }
+]

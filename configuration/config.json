@@ -1,0 +1,16 @@
+{
+  "aws_account_id": "123456789012",
+  "aws_region": "us-east-1",
+  "execution_mode": "dry_run",
+  "target_datasets": {
+    "mode": "explicit",
+    "dataset_ids": ["dataset-id-1", "dataset-id-2"]
+  },
+  "safety_threshold_pct": 0.7,
+  "_comment_quarantine": "Omit quarantine_period_days to run with no waiting period, which is the default. Setting it requires deploying with QuarantineEnabled=true, otherwise the run is refused rather than proceeding without the guardrail.",
+  "_comment_s3_bucket": "Use the S3BucketName output of your CloudFormation stack, never a name you do not own.",
+  "s3_bucket": "<your-optimiser-bucket-name>",
+  "s3_prefix": "spice-optimiser/",
+  "sns_topic_arn": "arn:aws:sns:us-east-1:123456789012:qs-optimiser-alerts",
+  "dynamodb_table": "qs-optimiser-quarantine"
+}

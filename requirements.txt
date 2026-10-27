@@ -1,0 +1,11 @@
+# Runtime dependency. A floor rather than a pin: scripts/deploy_all.sh installs the
+# latest boto3 into the deployment package, and below 1.43.64 the SDK mis-reads
+# file-upload and new-experience datasets (see setup.py).
+boto3>=1.43.64
+
+# Test dependencies, pinned to the versions the suite was last run with so a fresh
+# install cannot pull an untested release. Bump deliberately, with a green test run.
+hypothesis==6.170.11
+pytest==9.1.1
+pytest-cov==7.1.0
+pyyaml==6.0.2
