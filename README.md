@@ -190,7 +190,7 @@ What the prompt covers, so you can tell whether an edit belongs in it:
 User:  What SPICE datasets do I have in account 123456789012?
 
 Agent: [calls list_spice_datasets]
-       You have 63 SPICE datasets. Here are the top ones by storage:
+       You have 64 SPICE datasets. Here are the top ones by storage:
        - sample-quicksight-dataset (4.3 KB)
        - sales-summary-2024 (12.1 MB)
        ...
